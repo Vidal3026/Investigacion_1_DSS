@@ -21,40 +21,53 @@ from cifrado import (
     evaluar_llaves,
 )
 
+# Dirección y puerto en los que el servidor escuchará
 HOST = "127.0.0.1"
 PUERTO = 9000
 
 
 class ServidorApp:
     def __init__(self, root):
+        """
+        Inicializa la ventana principal del servidor:
+        - Configura el área de texto para mostrar logs y resultados
+        - Crea botones para evaluar llaves
+        - Muestra la clave compartida
+        - Ejecuta una primera evaluación de llaves
+        - Lanza el hilo del servidor TCP
+        """
         self.root = root
         self.root.title("Servidor de Mensajes")
-        self.root.geometry("700x520")
+        self.root.geometry("700x550")
 
-        # Área de texto (scroll)
+        # Área de texto con scroll para mostrar mensajes de log
         self.texto = scrolledtext.ScrolledText(root, wrap="word", width=90, height=28)
         self.texto.pack(padx=10, pady=10)
 
-        # Botones: evaluar llaves en tiempo real
+        # Frame con botones para evaluar la calidad de generación de llaves
         frame = tk.Frame(root)
         frame.pack(pady=5)
         tk.Button(frame, text="Evaluar llaves (200)", command=self.eval_200).pack(side="left", padx=5)
         tk.Button(frame, text="Evaluar llaves (1000)", command=self.eval_1000).pack(side="left", padx=5)
         tk.Button(frame, text="Evaluar N...", command=self.eval_custom).pack(side="left", padx=5)
 
-        # Mostrar clave compartida 
+        # Mostrar en pantalla la clave compartida (en hex), solo con fines de demostración
         self.append_text(f"[+] Clave compartida (hex): {CLAVE_SECRETA.hex()}\n\n")
 
-        # Evaluación inicial
+        # Realizar evaluación inicial con 200 llaves
         self.mostrar_evaluacion(200)
 
-        # Iniciar servidor en hilo
+        # Iniciar el servidor en un hilo independiente para no bloquear la interfaz
         self.hilo = threading.Thread(target=self.iniciar_servidor, daemon=True)
         self.hilo.start()
 
     # -------- Interacción segura con Tkinter desde hilos -------
     def append_text(self, texto: str):
-        """Inserta texto en el widget desde cualquier hilo de forma segura."""
+        """
+        Inserta texto en el widget ScrolledText desde cualquier hilo.
+        Se usa .after(0, ...) para asegurar que Tkinter procese la inserción
+        en el hilo principal de la GUI.
+        """
         def task():
             self.texto.insert("end", texto)
             self.texto.see("end")
@@ -62,6 +75,10 @@ class ServidorApp:
 
     # -------- Evaluación de llaves y despliegue ----------
     def mostrar_evaluacion(self, n: int):
+        """
+        Genera n llaves aleatorias, calcula estadísticas de calidad
+        (unicidad, colisiones, entropía, chi-cuadrado) y las muestra en la interfaz.
+        """
         stats = evaluar_llaves(n)
         s = (
             f"[+] Evaluación de llaves (n={stats['total']}, length={stats['longitud_bytes']} bytes)\n"
@@ -72,21 +89,32 @@ class ServidorApp:
         self.append_text(s)
 
     def eval_200(self):
+        """Botón para evaluar 200 llaves."""
         self.mostrar_evaluacion(200)
 
     def eval_1000(self):
+        """Botón para evaluar 1000 llaves."""
         self.mostrar_evaluacion(1000)
 
     def eval_custom(self):
+        """
+        Abre un diálogo para que el usuario ingrese cuántas llaves
+        quiere evaluar (entre 10 y 100000).
+        """
         n = simpledialog.askinteger("Evaluar N", "Número de llaves a generar:", minvalue=10, maxvalue=100000)
         if n:
             self.mostrar_evaluacion(n)
 
     # -------- Servidor TCP ----------
     def iniciar_servidor(self):
-        """Arranca el servidor y acepta conexiones; cada cliente en un hilo."""
+        """
+        Arranca el servidor TCP que:
+        - Escucha en HOST:PUERTO
+        - Acepta múltiples conexiones de clientes
+        - Lanza un hilo separado para manejar cada cliente
+        """
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # permite reutilizar el puerto
             s.bind((HOST, PUERTO))
             s.listen()
             self.append_text(f"[+] Servidor escuchando en {HOST}:{PUERTO}\n\n")
@@ -96,11 +124,12 @@ class ServidorApp:
 
     def manejar_cliente(self, conn: socket.socket, addr):
         """
-        Maneja un cliente: lee en bucle, parsea tipo de mensaje y procesa:
-         - HELO| : mensaje de saludo (sin autenticación) -> responde ACK_| con tag
-         - DATA| : payload cifrado+tag -> verificar tag, descifrar y ACK
-         - ACK_| : ack cifrado -> verificar y mostrar
-         - ERR_| : error cifrado -> verificar y mostrar
+        Maneja la comunicación con un cliente específico en un hilo independiente.
+        El protocolo soporta mensajes de tipo:
+         - HELO| : handshake inicial sin autenticación, servidor responde con ACK_| cifrado
+         - DATA| : mensaje de datos cifrado + tag, servidor verifica y responde ACK_| o ERR_|
+         - ACK_| : acuse de recibo desde cliente, servidor lo muestra
+         - ERR_| : error desde cliente, servidor lo muestra
         """
         with conn:
             self.append_text(f"[+] Conexión desde {addr}\n")
@@ -108,48 +137,50 @@ class ServidorApp:
                 while True:
                     datos = conn.recv(8192)
                     if not datos:
+                        # Cliente cerró la conexión
                         self.append_text(f"[{addr}] Cliente desconectó.\n\n")
                         break
 
-                    # Parse simple del tipo
+                    # Intentar extraer tipo y cuerpo del mensaje recibido
                     try:
                         tipo, body = parse_message(datos)
                     except Exception as e:
+                        # Si el mensaje no cumple el formato esperado, se envía un error cifrado
                         self.append_text(f"[{addr}] Paquete inválido: {e}\n")
-                        # responder error simple (sin autenticación)
                         conn.sendall(package_message("ERR_|", b"PAQUETE_INVALIDO", CLAVE_SECRETA, auth=True))
                         continue
 
-                    tipo = tipo.strip()  # quitar posibles espacios
-                    # Mostrar raw recibido en hex
+                    tipo = tipo.strip()  # limpiar espacios innecesarios
+                    # Mostrar log con longitud del body recibido
                     self.append_text(f"[{addr}] Recibido tipo='{tipo}' - paquetelen={len(body)} bytes\n")
+
+                    # ---- Procesamiento según tipo ----
                     if tipo == "HELO|":
-                        # HELO se envía en claro para handshake demo; servidor responde ACK cifrado
+                        # Mensaje en claro usado para handshake de demostración
                         self.append_text(f"[{addr}] HELO (handshake) recibido (sin cifrar).\n")
-                        # Responder ACK cifrado con tag
+                        # Responder con un ACK cifrado y autenticado
                         resp = package_message("ACK_|", b"HELLO_OK", CLAVE_SECRETA, auth=True)
                         conn.sendall(resp)
 
                     elif tipo == "DATA|":
-                        # Mostrar ciphertext (hex)
+                        # Mostrar el payload cifrado en formato hexadecimal
                         self.append_text(f"[{addr}] Cifrado (hex): {binascii.hexlify(body).decode()}\n")
-                        # Verificar tag y descifrar
                         try:
+                            # Verificar tag y descifrar contenido
                             claro = verify_and_decrypt(body, CLAVE_SECRETA)
-                            # Mostrar texto descifrado (utf-8 con replace)
-                            txt = claro.decode(errors="replace")
+                            txt = claro.decode(errors="replace")  # decodificar texto descifrado
                             self.append_text(f"[{addr}] Descifrado: {txt}\n\n")
-                            # Responder ACK cifrado
+                            # Responder con un ACK cifrado
                             ack = package_message("ACK_|", b"RECEIVED", CLAVE_SECRETA, auth=True)
                             conn.sendall(ack)
                         except ValueError as ve:
+                            # Tag inválido o problema en descifrado
                             self.append_text(f"[{addr}] ERROR: {ve}\n")
-                            # Responder error cifrado para evidenciar falla
                             err = package_message("ERR_|", str(ve).encode(), CLAVE_SECRETA, auth=True)
                             conn.sendall(err)
 
                     elif tipo == "ACK_|":
-                        # Acknowledge: verificar tag y mostrar contenido
+                        # Cliente envió un ACK, verificar autenticidad y mostrarlo
                         try:
                             claro = verify_and_decrypt(body, CLAVE_SECRETA)
                             txt = claro.decode(errors="replace")
@@ -158,7 +189,7 @@ class ServidorApp:
                             self.append_text(f"[{addr}] ACK con TAG inválido: {ve}\n\n")
 
                     elif tipo == "ERR_|":
-                        # Mensaje de error desde cliente (verificar)
+                        # Cliente envió un error, verificar autenticidad
                         try:
                             claro = verify_and_decrypt(body, CLAVE_SECRETA)
                             txt = claro.decode(errors="replace")
@@ -167,13 +198,16 @@ class ServidorApp:
                             self.append_text(f"[{addr}] ERR recibido con TAG inválido.\n\n")
 
                     else:
+                        # Tipo de mensaje no reconocido
                         self.append_text(f"[{addr}] Tipo desconocido: '{tipo}'\n\n")
 
             except Exception as e:
+                # Cualquier excepción en el hilo de cliente se muestra en logs
                 self.append_text(f"[{addr}] Excepción en handler: {e}\n\n")
 
 
 if __name__ == "__main__":
+    # Crear la ventana principal y lanzar la aplicación servidor
     root = tk.Tk()
     app = ServidorApp(root)
     root.mainloop()
